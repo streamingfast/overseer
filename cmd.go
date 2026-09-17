@@ -54,6 +54,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -601,6 +602,12 @@ var (
 	// occur, try increasing the size by calling OutputBuffer.SetLineBufferSize.
 	DEFAULT_LINE_BUFFER_SIZE = 16384
 
+	// MAX_LINE_BUFFER_SIZE is the size the OutputStream line buffer is allowed to
+	// grow to when an unterminated line does not fit in DEFAULT_LINE_BUFFER_SIZE.
+	// ErrLineBufferOverflow is returned only past this size. A value lower than
+	// DEFAULT_LINE_BUFFER_SIZE disables growth.
+	MAX_LINE_BUFFER_SIZE = 0
+
 	// DEFAULT_STREAM_CHAN_SIZE is the default string channel size for a Cmd when
 	// Options.Streaming is true. The string channel size can have a minor
 	// performance impact if too small by causing OutputStream.Write to block
@@ -665,8 +672,8 @@ func (e ErrLineBufferOverflow) Error() string {
 type OutputStream struct {
 	streamChan chan string
 	bufSize    int
+	maxBufSize int
 	buf        []byte
-	lastChar   int
 }
 
 // NewOutputStream creates a new streaming output on the given channel. The
@@ -676,9 +683,9 @@ func NewOutputStream(streamChan chan string) *OutputStream {
 	out := &OutputStream{
 		streamChan: streamChan,
 		// --
-		bufSize:  DEFAULT_LINE_BUFFER_SIZE,
-		buf:      make([]byte, DEFAULT_LINE_BUFFER_SIZE),
-		lastChar: 0,
+		bufSize:    DEFAULT_LINE_BUFFER_SIZE,
+		maxBufSize: MAX_LINE_BUFFER_SIZE,
+		buf:        make([]byte, 0, DEFAULT_LINE_BUFFER_SIZE),
 	}
 	return out
 }
@@ -702,45 +709,74 @@ func (rw *OutputStream) Write(p []byte) (n int, err error) {
 		// End of line offset is start (nextLine) + newline offset. Like bufio.Scanner,
 		// we allow \r\n but strip the \r too by decrementing the offset for that byte.
 		lastChar := firstChar + newlineOffset // "line\n"
-		if newlineOffset > 0 && p[newlineOffset-1] == '\r' {
+		if newlineOffset > 0 && p[lastChar-1] == '\r' {
 			lastChar-- // "line\r\n"
 		}
 
-		// Send the line, prepend line buffer if set
-		var line string
-		if rw.lastChar > 0 {
-			line = string(rw.buf[0:rw.lastChar])
-			rw.lastChar = 0 // reset buffer
-		}
-		line += string(p[firstChar:lastChar])
-		rw.streamChan <- line // blocks if chan full
+		rw.streamChan <- rw.takeLine(p[firstChar:lastChar]) // blocks if chan full
 
 		// Next line offset is the first byte (+1) after the newline (i)
 		firstChar += newlineOffset + 1
 	}
 
 	if firstChar < n {
-		remain := len(p[firstChar:])
-		bufFree := len(rw.buf[rw.lastChar:])
-		if remain > bufFree {
-			var line string
-			if rw.lastChar > 0 {
-				line = string(rw.buf[0:rw.lastChar])
-			}
-			line += string(p[firstChar:])
+		remain := p[firstChar:]
+		limit := rw.bufLimit()
+		if len(rw.buf)+len(remain) > limit {
 			err = ErrLineBufferOverflow{
-				Line:       line,
-				BufferSize: rw.bufSize,
-				BufferFree: bufFree,
+				Line:       string(rw.buf) + string(remain),
+				BufferSize: limit,
+				BufferFree: limit - len(rw.buf),
 			}
 			n = firstChar
 			return // implicit
 		}
-		copy(rw.buf[rw.lastChar:], p[firstChar:])
-		rw.lastChar += remain
+
+		if len(rw.buf)+len(remain) > cap(rw.buf) {
+			newCap := 2 * cap(rw.buf)
+			if newCap < len(rw.buf)+len(remain) {
+				newCap = len(rw.buf) + len(remain)
+			}
+			if newCap > limit {
+				newCap = limit
+			}
+			grown := make([]byte, len(rw.buf), newCap)
+			copy(grown, rw.buf)
+			rw.buf = grown
+		}
+		rw.buf = append(rw.buf, remain...)
 	}
 
 	return // implicit
+}
+
+// takeLine returns the buffered partial line followed by tail and empties the
+// buffer. A buffer that grew past bufSize is released so a single huge line
+// does not keep its memory for the life of the stream.
+func (rw *OutputStream) takeLine(tail []byte) string {
+	if len(rw.buf) == 0 {
+		return string(tail)
+	}
+
+	var line strings.Builder
+	line.Grow(len(rw.buf) + len(tail))
+	line.Write(rw.buf)
+	line.Write(tail)
+
+	if cap(rw.buf) > rw.bufSize {
+		rw.buf = make([]byte, 0, rw.bufSize)
+	} else {
+		rw.buf = rw.buf[:0]
+	}
+
+	return line.String()
+}
+
+func (rw *OutputStream) bufLimit() int {
+	if rw.maxBufSize > rw.bufSize {
+		return rw.maxBufSize
+	}
+	return rw.bufSize
 }
 
 // Lines returns the channel to which lines are sent. This is the same channel
@@ -756,5 +792,11 @@ func (rw *OutputStream) Lines() <-chan string {
 // Increasing the line buffer size can help reduce ErrLineBufferOverflow errors.
 func (rw *OutputStream) SetLineBufferSize(n int) {
 	rw.bufSize = n
-	rw.buf = make([]byte, rw.bufSize)
+	rw.buf = make([]byte, 0, rw.bufSize)
+}
+
+// SetMaxLineBufferSize sets the size the internal line buffer is allowed to grow
+// to. The default is MAX_LINE_BUFFER_SIZE. Same calling rules as SetLineBufferSize.
+func (rw *OutputStream) SetMaxLineBufferSize(n int) {
+	rw.maxBufSize = n
 }

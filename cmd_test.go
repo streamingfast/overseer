@@ -1084,3 +1084,60 @@ func TestCmdWrongArgs(t *testing.T) {
 		t.Errorf("got PID %d, expected non-zero", s.PID)
 	}
 }
+
+func TestStreamingLineBufferGrowsUpToMax(t *testing.T) {
+	lines := make(chan string, 5)
+	out := cmd.NewOutputStream(lines)
+	out.SetLineBufferSize(4)
+	out.SetMaxLineBufferSize(16)
+
+	// "0123456789" does not fit the 4 byte buffer, so the buffer grows
+	for _, chunk := range []string{"ab\n0123", "456789", "\ncd\n"} {
+		n, err := out.Write([]byte(chunk))
+		if err != nil {
+			t.Fatalf("Write(%q) error '%v', expected nil", chunk, err)
+		}
+		if n != len(chunk) {
+			t.Fatalf("Write(%q) n = %d, expected %d", chunk, n, len(chunk))
+		}
+	}
+
+	for _, expected := range []string{"ab", "0123456789", "cd"} {
+		select {
+		case gotLine := <-lines:
+			if gotLine != expected {
+				t.Errorf("got line '%s', expected '%s'", gotLine, expected)
+			}
+		default:
+			t.Fatalf("blocked on <-lines, expected '%s'", expected)
+		}
+	}
+
+	// Past the max size, the overflow error is returned
+	n, err := out.Write([]byte("0123456789abcdefg"))
+	if n != 0 {
+		t.Errorf("Write n = %d, expected 0", n)
+	}
+	lbo, ok := err.(cmd.ErrLineBufferOverflow)
+	if !ok {
+		t.Fatalf("got err '%v', expected cmd.ErrLineBufferOverflow", err)
+	}
+	if lbo.BufferSize != 16 {
+		t.Errorf("ErrLineBufferOverflow.BufferSize = %d, expected 16", lbo.BufferSize)
+	}
+}
+
+func TestStreamingCarriageReturnAfterFirstLine(t *testing.T) {
+	lines := make(chan string, 5)
+	out := cmd.NewOutputStream(lines)
+
+	if _, err := out.Write([]byte("fo\r\nbar\r\n")); err != nil {
+		t.Fatalf("error '%v', expected nil", err)
+	}
+
+	for _, expected := range []string{"fo", "bar"} {
+		if gotLine := <-lines; gotLine != expected {
+			t.Errorf("got line '%q', expected '%q'", gotLine, expected)
+		}
+	}
+}
