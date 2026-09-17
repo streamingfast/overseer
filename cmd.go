@@ -85,6 +85,9 @@ type Cmd struct {
 	changeChan chan CmdState // state changes feed
 	doneChan   chan struct{} // closed when done running
 	buffered   bool          // buffer STDOUT and STDERR to Status.Stdout and Std
+
+	stdoutWriter io.Writer // receives STDOUT as is when set (see Options)
+	stderrWriter io.Writer // receives STDERR as is when set (see Options)
 }
 
 // Status represents the running status and consolidated return of a Cmd. It can
@@ -131,6 +134,12 @@ type Options struct {
 	// faster and more efficient than polling Cmd.Status. The caller must read both
 	// streaming channels, else lines are dropped silently.
 	Streaming bool
+
+	// If StdoutWriter or StderrWriter is set, the raw output of the command is
+	// written to it as it is read, and Buffered and Streaming are ignored for
+	// that stream. Every call to Start writes to the same writers.
+	StdoutWriter io.Writer
+	StderrWriter io.Writer
 }
 
 // NewCmd creates a new Cmd for the given command name and arguments.
@@ -176,6 +185,8 @@ func NewCmd(name string, args ...interface{}) *Cmd {
 		c.DelayStart = opts.DelayStart
 	}
 	c.buffered = opts.Buffered
+	c.stdoutWriter = opts.StdoutWriter
+	c.stderrWriter = opts.StderrWriter
 	if opts.Streaming {
 		c.Stdout = make(chan string, DEFAULT_STREAM_CHAN_SIZE)
 		c.Stderr = make(chan string, DEFAULT_STREAM_CHAN_SIZE)
@@ -197,6 +208,9 @@ func (c *Cmd) Clone() *Cmd {
 			RetryTimes: c.RetryTimes,
 			Buffered:   c.buffered,
 			Streaming:  c.Stdout != nil,
+
+			StdoutWriter: c.stdoutWriter,
+			StderrWriter: c.stderrWriter,
 		},
 	)
 	return clone
@@ -448,6 +462,13 @@ func (c *Cmd) run() {
 		// No output (effectively >/dev/null 2>&1)
 		cmd.Stdout = nil
 		cmd.Stderr = nil
+	}
+
+	if c.stdoutWriter != nil {
+		cmd.Stdout = c.stdoutWriter
+	}
+	if c.stderrWriter != nil {
+		cmd.Stderr = c.stderrWriter
 	}
 
 	// Set the runtime environment for the command as per os/exec.Cmd.
