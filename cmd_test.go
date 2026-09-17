@@ -6,6 +6,7 @@ package overseer_test
 // and testify/assert for manager_test
 // Not optimal
 import (
+	"bytes"
 	"errors"
 	"io/ioutil"
 	"os"
@@ -1139,5 +1140,21 @@ func TestStreamingCarriageReturnAfterFirstLine(t *testing.T) {
 		if gotLine := <-lines; gotLine != expected {
 			t.Errorf("got line '%q', expected '%q'", gotLine, expected)
 		}
+	}
+}
+
+func TestCmdOutputWriters(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	p := cmd.NewCmd("bash", []string{"-c", "echo out; echo err >&2; printf tail"}, cmd.Options{StdoutWriter: &stdout, StderrWriter: &stderr})
+
+	status := <-p.Start()
+	if status.Exit != 0 || status.Error != nil {
+		t.Fatalf("got exit %d and error '%v', expected 0 and nil", status.Exit, status.Error)
+	}
+	if stdout.String() != "out\ntail" {
+		t.Errorf("got stdout %q, expected %q", stdout.String(), "out\ntail")
+	}
+	if stderr.String() != "err\n" {
+		t.Errorf("got stderr %q, expected %q", stderr.String(), "err\n")
 	}
 }
